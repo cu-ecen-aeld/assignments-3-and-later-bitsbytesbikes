@@ -84,8 +84,9 @@ ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
 
 
 # TODO: Add library dependencies to rootfs
-cp /home/baggio/software/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc/lib/* ${OUTDIR}/rootfs/lib/
-cp /home/baggio/software/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc/lib64/* ${OUTDIR}/rootfs/lib64/
+COMPILER_DIR=$(dirname `which ${CROSS_COMPILE}gcc`)
+cp ${COMPILER_DIR}/../aarch64-none-linux-gnu/libc/lib/* ${OUTDIR}/rootfs/lib/
+cp ${COMPILER_DIR}/../aarch64-none-linux-gnu/libc/lib64/* ${OUTDIR}/rootfs/lib64/
 
 # TODO: Make device nodes
 sudo mknod -m 666 dev/null c 1 3
