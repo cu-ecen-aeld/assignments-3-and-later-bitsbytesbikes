@@ -3,11 +3,11 @@
 case "$1" in
     start)
         echo "Starting aesdsocketserver"
-        start-stop-daemon -S -n aesdsocketserver -d
+        start-stop-daemon -S -n aesdsocket -d
         ;;
     stop)
         echo "Stopping aesdsocketserver"
-        start-stop-daemon -K -n aesdsocketserver
+        start-stop-daemon -K -n aesdsocket
         ;;
     *)
         echo "Usage $0 {start|stop}"
