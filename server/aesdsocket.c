@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -9,27 +10,56 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include "queue.h"
 
 
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
 
-int setup_signal_handling(void);
+static int setup_signal_handling(void);
+static int setup_timer_handling();
 static void signal_handler(int signo);
 static void write_package(const char *package_buffer, size_t packet_size);
 static void write_response(int clientfd);
-static void handle_client(int clientfd, struct sockaddr_in client_addr);
+static void *handle_client(void *params);
+static void timer_expired(union sigval timer_data);
 
 static bool server_active = true;
 static bool accepting_connection = false;
 
 static int socketfd;
-char *packet_buffer=NULL;
-size_t packet_buffer_size = BUFFER_SIZE;
+
+SLIST_HEAD(slisthead,client_thread_args) client_thread_list = SLIST_HEAD_INITIALIZER(client_thread_list);
+
+struct client_thread_args
+{
+    pthread_t          thread_id;
+    int                clientfd;
+    struct sockaddr_in client_addr;
+    bool               thread_finish_requested;
+    bool               thread_finished;
+    pthread_mutex_t    *output_lock;
+    char               *packet_buffer;
+    size_t             packet_buffer_size;
+    SLIST_ENTRY(client_thread_args) entries;
+};
+
+struct timer_data {
+    pthread_mutex_t    *output_lock;	
+};
+    
+
+static pthread_mutex_t output_lock;
 
 int main(int argc, char **argv)
 {
+    SLIST_INIT(&client_thread_list);
+
+    pthread_mutex_init(&output_lock, NULL);
+
     if(argc > 1)
     {
         for(int i = 1; i < argc; i++)
@@ -43,6 +73,11 @@ int main(int argc, char **argv)
     }
 
     if(setup_signal_handling() != 0)
+    {
+        return -1;
+    }
+
+    if(setup_timer_handling(&output_lock) != 0)
     {
         return -1;
     }
@@ -66,11 +101,6 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    packet_buffer = malloc(packet_buffer_size + sizeof(char));
-    if(packet_buffer == NULL)
-    {
-        return -1;
-    }
 
     while(server_active)
     {
@@ -94,18 +124,58 @@ int main(int argc, char **argv)
             return -1;
         }
 
-        handle_client(clientfd, client_addr);
+	    struct client_thread_args *thread_args = malloc(sizeof(struct client_thread_args));
+
+        if(thread_args == NULL)
+        {
+                perror("Error allocating memory for thread arguments.");
+                return -1;
+        }
+	
+        SLIST_INSERT_HEAD(&client_thread_list, thread_args, entries);
+        thread_args->thread_finished = false;
+        thread_args->clientfd = clientfd;
+        thread_args->client_addr = client_addr;
+        thread_args->thread_finish_requested = false;
+        thread_args->output_lock = &output_lock;
+        thread_args->packet_buffer = NULL;
+        thread_args->packet_buffer_size = BUFFER_SIZE;
+
+        pthread_create(&(thread_args->thread_id), NULL, handle_client, thread_args);
+
+        struct client_thread_args *current;
+        struct client_thread_args *np_tmp;
+        SLIST_FOREACH_SAFE(current, &client_thread_list, entries, np_tmp) {
+            if(current->thread_finished)
+	    {
+	        SLIST_REMOVE(&client_thread_list, current, client_thread_args, entries);
+	        pthread_join(current->thread_id, NULL);
+	        free(current);
+	    }
+	}
     }
 
     if(unlink("/var/tmp/aesdsocketdata") != 0)
         perror("Error deleting file");
-    free(packet_buffer);
     close(socketfd);
     return EXIT_SUCCESS;
 }
 
-static void handle_client(int clientfd, struct sockaddr_in client_addr)
+static void *handle_client(void *params)
 {
+
+    
+    struct client_thread_args *client = (struct client_thread_args *)params;
+    int clientfd = client->clientfd;
+    struct sockaddr_in client_addr = client->client_addr;
+    
+    client->packet_buffer = malloc(client->packet_buffer_size + sizeof(char));
+    if(client->packet_buffer == NULL)
+    {
+        perror("Error allocating packet buffer");
+        return NULL;
+    }
+
     char recv_buffer[BUFFER_SIZE];
     char client_str[INET_ADDRSTRLEN];
     inet_ntop( AF_INET, &(client_addr.sin_addr), client_str, INET_ADDRSTRLEN );
@@ -114,7 +184,7 @@ static void handle_client(int clientfd, struct sockaddr_in client_addr)
     size_t packet_size = 0;
     bool packet_finished = false;
 
-    while(true)
+    while(!client->thread_finish_requested)
     {
         int received_bytes = 0;
         received_bytes = recv(clientfd, recv_buffer, sizeof(recv_buffer), 0);
@@ -123,6 +193,7 @@ static void handle_client(int clientfd, struct sockaddr_in client_addr)
         {
             //ERROR
             perror("Error after receive");
+	        client->thread_finished = true;
             close(clientfd);
             break;
         }
@@ -132,13 +203,16 @@ static void handle_client(int clientfd, struct sockaddr_in client_addr)
             packet_size = 0;
             syslog(LOG_INFO, "Closed connection from %s", client_str);
             close(clientfd);
-            return;
+            client->thread_finished = true;
+            free(client->packet_buffer);
+            client->packet_buffer = NULL;
+            return NULL;
         }
 
-        while(packet_buffer_size <= (packet_size + received_bytes))
+        while(client->packet_buffer_size <= (packet_size + received_bytes))
         {
-            packet_buffer_size += BUFFER_SIZE;
-            if((packet_buffer=realloc(packet_buffer, packet_buffer_size)) == 0)
+            client->packet_buffer_size += BUFFER_SIZE;
+            if((client->packet_buffer=realloc(client->packet_buffer, client->packet_buffer_size)) == 0)
             {
                 perror("Failed to allocate memory");
                 exit(-1);
@@ -147,7 +221,7 @@ static void handle_client(int clientfd, struct sockaddr_in client_addr)
 
         for(int i = 0; i < BUFFER_SIZE; i++)
         {
-            packet_buffer[packet_size] = recv_buffer[i];
+            client->packet_buffer[packet_size] = recv_buffer[i];
             packet_size++;
             if(recv_buffer[i] == '\n')
             {
@@ -158,12 +232,19 @@ static void handle_client(int clientfd, struct sockaddr_in client_addr)
 
         if(packet_finished)
         {
-            write_package(packet_buffer, packet_size);
+	        pthread_mutex_lock(client->output_lock);
+            write_package(client->packet_buffer, packet_size);
             packet_finished = false;
             write_response(clientfd);
+	        pthread_mutex_unlock(client->output_lock);
         }
 
     }
+
+    client->thread_finished = true;
+    free(client->packet_buffer);
+    client->packet_buffer = NULL;
+    return NULL;
 }
 
 static void write_package(const char *package_buffer, size_t packet_size)
@@ -172,7 +253,7 @@ static void write_package(const char *package_buffer, size_t packet_size)
     int out_fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_WRONLY | O_APPEND, mode);
     int written_bytes = 0;
     while(written_bytes < packet_size){
-        written_bytes += write(out_fd, packet_buffer, packet_size - written_bytes);
+        written_bytes += write(out_fd, package_buffer, packet_size - written_bytes);
     }
     close(out_fd);            
     packet_size = 0;
@@ -193,7 +274,7 @@ static void write_response(int clientfd)
     }
 }
     
-int setup_signal_handling(void)
+static int setup_signal_handling(void)
 {
     struct sigaction sig_action;// = {0};
     sig_action.sa_handler = signal_handler;
@@ -213,22 +294,94 @@ int setup_signal_handling(void)
     return 0;
 }
 
+static int setup_timer_handling()
+{
+    int res;
+    timer_t timer_id = 0;
+    struct sigevent sev = {0};
+    struct itimerspec its = {
+        .it_value.tv_sec = 10,
+        .it_value.tv_nsec = 0,
+        .it_interval.tv_sec = 10,
+        .it_interval.tv_nsec = 0	
+    };
+
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = &timer_expired;
+
+    res = timer_create(CLOCK_MONOTONIC, &sev, &timer_id);
+    if(res != 0) {
+         perror("Error creating timer");
+	 return -1;
+    }
+
+    res = timer_settime(timer_id, 0, &its, NULL);
+    if(res != 0) {
+         perror("Error timer_settime");
+	 return -1;
+    }
+
+    return 0;
+}
+
+static void timer_expired(union sigval timer_data) {
+    
+    time_t t = time(NULL);
+    char output_str[200];
+    struct tm *tmp;
+    tmp = localtime(&t);
+    int num_bytes = strftime(output_str, sizeof(output_str), "timestamp:%a, %d %b %Y %T", tmp);
+
+    if(num_bytes > 0)
+    {
+	    strcat(output_str, "\n");
+	    num_bytes += 1;
+        pthread_mutex_lock(&output_lock);    
+        mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+        int out_fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_WRONLY | O_APPEND, mode);
+        int written_bytes = 0;
+        while(written_bytes < num_bytes){
+            written_bytes += write(out_fd, &output_str[written_bytes], num_bytes - written_bytes);
+        }
+        close(out_fd);            
+	    pthread_mutex_unlock(&output_lock);
+    }	
+}
+
 static void signal_handler(int signo)
 {
     switch(signo)
     {
         case SIGINT:
         case SIGTERM:
+        {
+            struct client_thread_args *current;
+            struct client_thread_args *np_tmp;
+	        SLIST_FOREACH(current, &client_thread_list, entries) {
+		        current->thread_finish_requested = true;
+	        }
+            SLIST_FOREACH_SAFE(current, &client_thread_list, entries, np_tmp) {
+               if(current->thread_finished)
+	            {
+	                SLIST_REMOVE(&client_thread_list, current, client_thread_args, entries);
+	                pthread_join(current->thread_id, NULL);
+                    if(current->packet_buffer)
+                    {
+                        free(current->packet_buffer);
+                    }
+	                free(current);
+	            }
+	        }
             syslog(LOG_INFO, "Caught signal, exiting\n");
             if(accepting_connection)
             {
                 if(unlink("/var/tmp/aesdsocketdata") != 0)
                     perror("Error deleting file");
                 close(socketfd);
-                free(packet_buffer);
                 exit(EXIT_SUCCESS);
             }
             server_active = false;
+	    }
         default:
             //ERROR;
             break;
