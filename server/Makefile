@@ -6,7 +6,7 @@ all: aesdsocket
 
 
 aesdsocket: aesdsocket.c
-	$(CC) $(CFLAGS) -o aesdsocket aesdsocket.c $(LFLAGS)
+	$(CC) $(CFLAGS) -o aesdsocket aesdsocket.c $(LDFLAGS)
 
 clean:
 	rm -rf *.o aesdsocket list_t
