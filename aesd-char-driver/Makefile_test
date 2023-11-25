@@ -1,0 +1,5 @@
+buffertest: buffertest.c aesd-circular-buffer.c
+	$(CC) -Wall -Werror -Wpedantic -ggdb -o buffertest buffertest.c aesd-circular-buffer.c
+
+clean:
+	rm -rf buffertest 
