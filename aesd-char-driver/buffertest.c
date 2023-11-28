@@ -74,6 +74,43 @@ int main(int argc, char **argv)
     result = aesd_circular_buffer_find_entry_offset_for_fpos(&buf, 10, &pos);
     assert(strcmp(result->buffptr, "vier") == 0);
     assert(pos == 3);
+    
+    struct aesd_circular_buffer buf2;
+    aesd_circular_buffer_init(&buf2);
+
+    {
+        struct aesd_buffer_entry e1 = {.buffptr="write1\n", .size=strlen("write1\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e1);
+        struct aesd_buffer_entry e2 = {.buffptr="write2\n", .size=strlen("write2\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e2);
+        struct aesd_buffer_entry e3 = {.buffptr="write3\n", .size=strlen("write3\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e3);
+        struct aesd_buffer_entry e4 = {.buffptr="write4\n", .size=strlen("write4\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e4);
+        struct aesd_buffer_entry e5 = {.buffptr="write5\n", .size=strlen("write5\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e5);
+        struct aesd_buffer_entry e6 = {.buffptr="write6\n", .size=strlen("write6\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e6);
+        struct aesd_buffer_entry e7 = {.buffptr="write7\n", .size=strlen("write7\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e7);
+        struct aesd_buffer_entry e8 = {.buffptr="write8\n", .size=strlen("write8\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e8);
+        struct aesd_buffer_entry e9 = {.buffptr="write9\n", .size=strlen("write9\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e9);
+        struct aesd_buffer_entry e10 = {.buffptr="write10\n", .size=strlen("write10\n")};
+        aesd_circular_buffer_add_entry(&buf2, &e10);
+
+        struct aesd_buffer_entry *entry;
+        size_t pos;
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(&buf2, 0, &pos);
+        assert(strcmp(entry->buffptr, "write1\n") == 0);
+        
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(&buf2, 7, &pos);
+        assert(strcmp(entry->buffptr, "write2\n") == 0);
+
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(&buf2, 7, &pos);
+        assert(strcmp(entry->buffptr, "write2\n") == 0);
+    }
 
     return EXIT_SUCCESS;
 }

@@ -42,7 +42,7 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
             break;
         }
 
-        if( (buffer_offset + buffer->entry[buffer_position].size) < char_offset)
+        if( (buffer_offset + buffer->entry[buffer_position].size) <= char_offset)
         {
             buffer_offset += buffer->entry[buffer_position].size;
         }

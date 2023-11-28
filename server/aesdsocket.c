@@ -16,8 +16,14 @@
 #include "queue.h"
 
 
+/* If the following define is set to, one the kernel char driver 
+ * module is used for storing the strings */
+#define USE_AESD_CHAR_DEVICE        (1)
+
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
+
+SLIST_HEAD(slisthead,client_thread_args) client_thread_list = SLIST_HEAD_INITIALIZER(client_thread_list);
 
 static int setup_signal_handling(void);
 static int setup_timer_handling();
@@ -31,8 +37,6 @@ static bool server_active = true;
 static bool accepting_connection = false;
 
 static int socketfd;
-
-SLIST_HEAD(slisthead,client_thread_args) client_thread_list = SLIST_HEAD_INITIALIZER(client_thread_list);
 
 struct client_thread_args
 {
@@ -155,8 +159,11 @@ int main(int argc, char **argv)
 	}
     }
 
-    if(unlink("/var/tmp/aesdsocketdata") != 0)
-        perror("Error deleting file");
+    #if (USE_AESD_CHAR_DEVICE == 0)
+        if(unlink("/var/tmp/aesdsocketdata") != 0)
+            perror("Error deleting file");
+    #endif
+
     close(socketfd);
     return EXIT_SUCCESS;
 }
@@ -249,8 +256,12 @@ static void *handle_client(void *params)
 
 static void write_package(const char *package_buffer, size_t packet_size)
 {
-    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-    int out_fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_WRONLY | O_APPEND, mode);
+    #if (USE_AESD_CHAR_DEVICE == 0)
+        mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+        int out_fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_WRONLY | O_APPEND);
+    #else
+        int out_fd = open("/dev/aesdchar", O_WRONLY | O_APPEND);
+    #endif
     int written_bytes = 0;
     while(written_bytes < packet_size){
         written_bytes += write(out_fd, package_buffer, packet_size - written_bytes);
@@ -261,7 +272,11 @@ static void write_package(const char *package_buffer, size_t packet_size)
 
 static void write_response(int clientfd)
 {
-    int out_fd = open("/var/tmp/aesdsocketdata", O_RDONLY);
+    #if (USE_AESD_CHAR_DEVICE == 0)
+        int out_fd = open("/var/tmp/aesdsocketdata", O_RDONLY);
+    #else
+        int out_fd = open("/dev/aesdchar", O_RDONLY);
+    #endif
     char send_buffer[BUFFER_SIZE];
     int read_bytes;
     
