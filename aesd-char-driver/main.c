@@ -48,11 +48,11 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     ssize_t retval = 0;
-    struct aesd_buffer_entry *entry;
-    size_t entry_offset;
-    size_t bytes_deliverable;
-    unsigned long bytes_remaining;
-
+    uint8_t out_index = aesd_device.circ_buf.out_offs;
+    uint8_t entry_count = 0;
+    size_t bytes_remaining = count;
+    size_t bytes_skipped = 0;
+    size_t bytes_copied = 0;
 
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
     
@@ -61,34 +61,54 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
         return -ERESTARTSYS;
     }
 
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-        &aesd_device.circ_buf,
-        *f_pos, 
-        &entry_offset);
-    if(!entry)
+    while((aesd_device.circ_buf.entry[out_index].buffptr != NULL) 
+            && (entry_count < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED))
     {
-        PDEBUG("Entry could not be found in circular buffer");
-        mutex_unlock(&aesd_device.mutex);
-        return -EFAULT;
+        size_t bytes_to_copy = aesd_device.circ_buf.entry[out_index].size;
+        size_t bytes_not_copied;
+
+        if(bytes_remaining < bytes_to_copy)
+        {
+            bytes_to_copy = bytes_remaining;
+        }
+        
+        if(bytes_skipped < *f_pos)
+        {
+            bytes_skipped += aesd_device.circ_buf.entry[out_index].size;
+        }
+        else
+        {
+            // for debugging only
+            #if 0
+                char buffer[100] = {0};
+                memcpy(buffer, aesd_device.circ_buf.entry[out_index].buffptr, aesd_device.circ_buf.entry[out_index].size);
+                PDEBUG("Processing entry %s", buffer);
+            #endif
+
+            bytes_not_copied = copy_to_user(&buf[bytes_copied], aesd_device.circ_buf.entry[out_index].buffptr, bytes_to_copy);
+
+            if(bytes_not_copied)
+            {
+                mutex_unlock(&aesd_device.mutex);
+                return -ERESTARTSYS;
+            }
+
+            bytes_remaining -= bytes_to_copy;
+            bytes_copied += bytes_to_copy;
+
+            if(bytes_remaining == 0)
+            {
+                break;
+            }
+        }
+
+        out_index++;
+        out_index %= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        entry_count++;
     }
 
-    bytes_deliverable = count;
-    if(bytes_deliverable > (entry->size - entry_offset))
-    {
-        bytes_deliverable = entry->size - entry_offset;
-    }
-
-    bytes_remaining = copy_to_user(buf, &entry->buffptr[entry_offset], bytes_deliverable);
-    
-    if(bytes_remaining > 0)
-    {
-        PDEBUG("Not all bytes could be copied to the requested section");
-        mutex_unlock(&aesd_device.mutex);
-        return -ERESTARTSYS;
-    }
-
-    retval = bytes_deliverable;
-    *f_pos += bytes_deliverable;
+    retval = bytes_copied;
+    *f_pos += bytes_copied;
     
     mutex_unlock(&aesd_device.mutex);
     return retval;
@@ -99,8 +119,10 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 {
     ssize_t retval = -ENOMEM;
     size_t  uncopied = 0;
-    unsigned int newline_index;
-    bool newline_found = false;
+    unsigned int last_newline_index;
+    unsigned int i;
+    unsigned int command_start_index = 0;
+    bool newline_in_buffer = false;
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
     
@@ -131,6 +153,15 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     }
 
     PDEBUG("Writing to command buffer index %ld", aesd_device.bytes_in_command_buffer);
+
+    // for debugging only
+    #if 0
+        char tmp_buf[100] = {0};
+        memcpy(tmp_buf, buf, count);
+        PDEBUG("Receiving buffer from user %s", tmp_buf);
+        PDEBUG("Number of bytes in buffer before copying: %lu", aesd_device.bytes_in_command_buffer);
+    #endif
+
     uncopied = copy_from_user(&aesd_device.command_buffer[aesd_device.bytes_in_command_buffer], buf, count);
     if(uncopied != 0)
     {
@@ -140,46 +171,68 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     aesd_device.bytes_in_command_buffer += (count - uncopied);
     retval = (count - uncopied);
 
-    for(newline_index = 0; newline_index < aesd_device.bytes_in_command_buffer; newline_index++)
+    for(i= 0; i < aesd_device.bytes_in_command_buffer;i++)
     {
-        if(aesd_device.command_buffer[newline_index] == '\n')
+        if(aesd_device.command_buffer[i] == '\n')
         {
-            newline_found = true;
-            break;
+            size_t command_len = i + 1 - command_start_index;
+            char *command_buf = kmalloc(command_len, GFP_KERNEL);
+            struct aesd_buffer_entry entry;
+            last_newline_index = i;
+            newline_in_buffer = true;
+            if(command_buf == NULL)
+            {
+                PDEBUG("Allocation of command buffer failed");
+                mutex_unlock(&aesd_device.mutex);
+                return -ENOMEM;
+            }
+            memcpy(command_buf, &aesd_device.command_buffer[command_start_index], command_len);
+            // for debugging only
+            #if 0
+                char buffer[100] = {0};
+                memcpy(buffer, command_buf, command_len);
+                PDEBUG("Processed command: %s", buffer);
+            #endif
+            // free the old entry in the ringbuffer
+            if(aesd_device.circ_buf.full)
+            {
+                // This should not be done here
+                kfree(aesd_device.circ_buf.entry[aesd_device.circ_buf.in_offs].buffptr);
+            }
+            entry.buffptr = command_buf;
+            entry.size = command_len;
+            aesd_circular_buffer_add_entry(&aesd_device.circ_buf, &entry);
+            command_start_index = i + 1;
         }
     }
 
-    if(newline_found)
+    if(newline_in_buffer)
     {
-        newline_index++;
-        char *command_buf = kmalloc(newline_index, GFP_KERNEL);
-        struct aesd_buffer_entry entry;
-        int i = 0;
-        
-        if(command_buf == NULL)
+        int idx = 0;
+        last_newline_index++;
+        while(last_newline_index < aesd_device.bytes_in_command_buffer)
         {
-            PDEBUG("command buffer could not be allocated");
-            mutex_unlock(&aesd_device.mutex);
-            return -ENOMEM;
+            aesd_device.command_buffer[idx] = aesd_device.command_buffer[last_newline_index++];
+            idx++;
         }
-        memcpy(command_buf, aesd_device.command_buffer, newline_index);
-        // free the old entry in the ringbuffer
-        if(aesd_device.circ_buf.full)
+        aesd_device.bytes_in_command_buffer = idx;
+    }
+
+    // for debugging only
+    #if 0
+    int index = 0;
+    struct aesd_buffer_entry *e;
+    PDEBUG("DEBUG BUFFER");
+    AESD_CIRCULAR_BUFFER_FOREACH(e, &aesd_device.circ_buf, index)
+    {
+        if(e->buffptr !=NULL)
         {
-            // This should not be done here
-            kfree(aesd_device.circ_buf.entry[aesd_device.circ_buf.in_offs].buffptr);
-        }
-        entry.buffptr = command_buf;
-        entry.size = newline_index;
-        aesd_circular_buffer_add_entry(&aesd_device.circ_buf, &entry);
-        
-        aesd_device.bytes_in_command_buffer -= newline_index;
-        while(newline_index < aesd_device.bytes_in_command_buffer)        
-        {
-            aesd_device.command_buffer[i] = aesd_device.command_buffer[newline_index];
-            i++;
+            char buffer[100] = {0};
+            memcpy(buffer, e->buffptr, e->size);
+            PDEBUG("entry: %s", buffer);
         }
     }
+    #endif
 
     mutex_unlock(&aesd_device.mutex);
 
@@ -228,10 +281,6 @@ int aesd_init_module(void)
     aesd_device.bytes_in_command_buffer = 0;
     aesd_circular_buffer_init(&aesd_device.circ_buf);
 
-    /**
-     * TODO: initialize the AESD specific portion of the device
-     */
-
     result = aesd_setup_cdev(&aesd_device);
 
     if( result ) {
@@ -244,12 +293,19 @@ int aesd_init_module(void)
 void aesd_cleanup_module(void)
 {
     dev_t devno = MKDEV(aesd_major, aesd_minor);
+    int index = 0;
+    struct aesd_buffer_entry *e;
 
     cdev_del(&aesd_device.cdev);
 
-    /**
-     * TODO: cleanup AESD specific poritions here as necessary
-     */
+    PDEBUG("DEBUG BUFFER");
+    AESD_CIRCULAR_BUFFER_FOREACH(e, &aesd_device.circ_buf, index)
+    {
+        if(e->buffptr !=NULL)
+        {
+            kfree(e->buffptr);
+        }
+    }
 
     unregister_chrdev_region(devno, 1);
 }
