@@ -14,11 +14,12 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "queue.h"
-
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 /* If the following define is set to, one the kernel char driver 
  * module is used for storing the strings */
 #define USE_AESD_CHAR_DEVICE        (1)
+#define AESD_MAX_IOC_SEEKTO_COMMAND (42)
 
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
@@ -28,8 +29,8 @@ SLIST_HEAD(slisthead,client_thread_args) client_thread_list = SLIST_HEAD_INITIAL
 static int setup_signal_handling(void);
 static int setup_timer_handling();
 static void signal_handler(int signo);
-static void write_package(const char *package_buffer, size_t packet_size);
-static void write_response(int clientfd);
+static void write_package(const char *package_buffer, size_t packet_size, int out_fd, int clientfd);
+static void write_response(int clientfd, int command, int command_offset);
 static void *handle_client(void *params);
 static void timer_expired(union sigval timer_data);
 
@@ -49,6 +50,7 @@ struct client_thread_args
     char               *packet_buffer;
     size_t             packet_buffer_size;
     SLIST_ENTRY(client_thread_args) entries;
+    int                out_fd;
 };
 
 struct timer_data {
@@ -170,8 +172,6 @@ int main(int argc, char **argv)
 
 static void *handle_client(void *params)
 {
-
-    
     struct client_thread_args *client = (struct client_thread_args *)params;
     int clientfd = client->clientfd;
     struct sockaddr_in client_addr = client->client_addr;
@@ -182,6 +182,13 @@ static void *handle_client(void *params)
         perror("Error allocating packet buffer");
         return NULL;
     }
+    
+    #if (USE_AESD_CHAR_DEVICE == 0)
+        mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+        client->out_fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_WRONLY | O_APPEND);
+    #else
+        client->out_fd = open("/dev/aesdchar", O_WRONLY | O_APPEND);
+    #endif
 
     char recv_buffer[BUFFER_SIZE];
     char client_str[INET_ADDRSTRLEN];
@@ -240,37 +247,78 @@ static void *handle_client(void *params)
         if(packet_finished)
         {
 	        pthread_mutex_lock(client->output_lock);
-            write_package(client->packet_buffer, packet_size);
+            write_package(client->packet_buffer, packet_size, client->out_fd, clientfd);
             packet_finished = false;
-            write_response(clientfd);
+            
+            #if 0 //Debug output
+            printf("Received command:\n\t");
+            for(int i = 0; i < packet_size; i++)
+            {
+                putchar(client->packet_buffer[i]);
+            }
+            printf("\n");
+            #endif
+
 	        pthread_mutex_unlock(client->output_lock);
         }
 
     }
 
     client->thread_finished = true;
+    close(client->out_fd);
     free(client->packet_buffer);
     client->packet_buffer = NULL;
     return NULL;
 }
 
-static void write_package(const char *package_buffer, size_t packet_size)
+static bool check_ioctl_command(int clientfd, const char *package_buffer, size_t packet_size)
 {
-    #if (USE_AESD_CHAR_DEVICE == 0)
-        mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-        int out_fd = open("/var/tmp/aesdsocketdata", O_CREAT | O_WRONLY | O_APPEND);
-    #else
-        int out_fd = open("/dev/aesdchar", O_WRONLY | O_APPEND);
-    #endif
-    int written_bytes = 0;
-    while(written_bytes < packet_size){
-        written_bytes += write(out_fd, package_buffer, packet_size - written_bytes);
+    bool ret = false;
+    
+    if((packet_size >= strlen("AESDCHAR_IOCSEEKTO:X,Y")) && (packet_size < AESD_MAX_IOC_SEEKTO_COMMAND))
+    {
+        char ioc_command[AESD_MAX_IOC_SEEKTO_COMMAND+1] = {0};
+        memcpy(ioc_command, package_buffer, packet_size);
+
+        if(memcmp(ioc_command, "AESDCHAR_IOCSEEKTO:", strlen("AESDCHAR_IOCSEEKTO:")) == 0)
+        {
+            int command = 0;
+            int offset = 0;
+            char *str_after_comma = strchr(&ioc_command[19], ',');
+
+            if(str_after_comma != NULL)
+            {
+                str_after_comma++;
+                command = atoi(&ioc_command[19]);
+                offset  = atoi(str_after_comma);
+                write_response(clientfd, command, offset);
+                ret = true;
+            }
+        }
     }
-    close(out_fd);            
+
+    return ret;
+}
+
+static void write_package(const char *package_buffer, size_t packet_size, int out_fd, int clientfd)
+{
+    bool is_ioctl = false;
+    #if (USE_AESD_CHAR_DEVICE != 0)
+        is_ioctl = check_ioctl_command(clientfd, package_buffer, packet_size);
+    #endif
+    if(!is_ioctl)
+    {
+        int written_bytes = 0;
+        while(written_bytes < packet_size){
+            written_bytes += write(out_fd, package_buffer, packet_size - written_bytes);
+        }
+
+        write_response(clientfd, 0, 0);
+    }
     packet_size = 0;
 }
 
-static void write_response(int clientfd)
+static void write_response(int clientfd, int command, int command_offset)
 {
     #if (USE_AESD_CHAR_DEVICE == 0)
         int out_fd = open("/var/tmp/aesdsocketdata", O_RDONLY);
@@ -279,7 +327,15 @@ static void write_response(int clientfd)
     #endif
     char send_buffer[BUFFER_SIZE];
     int read_bytes;
-    
+
+    if( (command != 0) || (command_offset != 0))
+    { 
+        struct aesd_seekto ioctl_struct;
+        ioctl_struct.write_cmd = command;
+        ioctl_struct.write_cmd_offset = command_offset;
+        ioctl(out_fd, AESDCHAR_IOCSEEKTO, (long*)&ioctl_struct);
+    }
+
     while((read_bytes=read(out_fd, send_buffer, BUFFER_SIZE)))
     {
         int sent_bytes = 0;
@@ -390,8 +446,10 @@ static void signal_handler(int signo)
             syslog(LOG_INFO, "Caught signal, exiting\n");
             if(accepting_connection)
             {
-                if(unlink("/var/tmp/aesdsocketdata") != 0)
-                    perror("Error deleting file");
+                #if (USE_AESD_CHAR_DEVICE != 0)
+                    if(unlink("/var/tmp/aesdsocketdata") != 0)
+                        perror("Error deleting file");
+                #endif
                 close(socketfd);
                 exit(EXIT_SUCCESS);
             }

@@ -34,6 +34,7 @@ struct aesd_dev
     unsigned char                  *command_buffer;
     size_t                         command_buffer_size;
     size_t                         bytes_in_command_buffer;
+    size_t                         fsize;
 };
 
 
